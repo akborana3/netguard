@@ -1,178 +1,43 @@
-# netguard
-You are a senior Android systems engineer and networking expert.
+# NetGuard-like Android Firewall
 
-I want you to build a production-level Android firewall app (like NetGuard) using VPNService that can fully block internet access per app WITHOUT root.
+A production-level Android firewall app using `VpnService` that can fully block internet access per app without root.
 
-⚠️ This is for PERSONAL USE, so you can request and use ANY required permissions and advanced techniques.
-
----
-
-🎯 CORE REQUIREMENTS
-
-Build a complete Android app with:
-
-🔐 Core Functionality
-
-1. Use Android VPNService to intercept ALL network traffic
-2. Implement per-app internet blocking using UID detection
-3. Support:
-   - Block selected apps
-   - Allow selected apps (block all others)
-4. Real packet filtering (not fake blocking)
-5. Handle:
-   - TCP
-   - UDP
-   - DNS
+## Features
+- **VPN Intercept:** Uses Android VPNService to intercept and filter network traffic.
+- **Split Tunneling:** Blocked apps have their traffic routed to the VPN interface (where it is dropped and logged). Allowed apps bypass the VPN entirely and connect directly to the internet.
+- **Per-App Controls:** Toggle Wi-Fi and Mobile Data access for every installed app.
+- **Time-based Rules:** Schedule when an app should have its internet blocked.
+- **DNS / Ad Blocking:** Intercepts DNS queries and blocks known ad domains.
+- **Traffic Logs:** View a live feed of blocked connections.
+- **Modern UI:** Material 3 dashboard, search, and tab navigation.
 
 ---
 
-🧠 Advanced Features (ALL REQUIRED)
+## 🤖 Hugging Face APK Build Instructions
 
-1. 📱 App List UI
-   
-   - Show all installed apps
-   - Toggle internet access per app
+This project includes a fully automated Dockerized build environment specifically designed to be hosted on **Hugging Face Spaces**. It compiles the Android APK and serves it via a built-in HTTP server.
 
-2. 🌐 Network Type Control
-   
-   - Separate toggles for:
-     - WiFi
-     - Mobile Data
+### Step 1: Create a Hugging Face Space
+1. Go to [Hugging Face Spaces](https://huggingface.co/spaces) and click **Create new Space**.
+2. **Space name:** `android-firewall-build`
+3. **License:** MIT (or any)
+4. **Select the Space SDK:** Choose **Docker**.
+5. **Choose Docker template:** Select **Blank**.
+6. Click **Create Space**.
 
-3. 📊 Traffic Logs
-   
-   - Show blocked & allowed connections
-   - App name + IP + time
+### Step 2: Upload Project Files
+Upload the entire contents of this repository to your new Space. You can do this in two ways:
+- **Git:** Clone the Hugging Face repository and push the files via command line.
+- **UI:** Click on the **Files** tab in your Space, click **Add file**, and drag-and-drop the files (maintain the folder structure).
 
-4. 🚫 DNS / Ad Blocking
-   
-   - Custom DNS filtering
-   - Block known ad domains
+### Step 3: Trigger the Build
+Once the files are uploaded, Hugging Face will automatically detect the `Dockerfile` and begin building the environment.
+- The build process will download the Android SDK, install Gradle, and compile the APK.
+- You can watch the progress in the **Logs** tab of your Space.
+- **Note:** The build may take several minutes to complete.
 
-5. ⏱ Time-based Rules
-   
-   - Schedule internet blocking
-
-6. 🔄 Persistent Background Service
-   
-   - Foreground service with notification
-   - Auto restart VPN if killed
-
----
-
-🎨 UI REQUIREMENTS
-
-- Use Material 3 (modern UI)
-- Clean dashboard:
-  - Start/Stop Firewall button
-  - Stats (blocked requests count)
-- App list with search + filters
-- Dark mode support
-
----
-
-🏗️ ARCHITECTURE
-
-Use clean architecture:
-
-- Language: Kotlin
-- MVVM pattern
-- Components:
-  - ViewModel
-  - Repository
-  - Service layer (VPN)
-  - Room Database
-
----
-
-⚙️ TECH IMPLEMENTATION DETAILS
-
-You MUST implement:
-
-1. VPN Core
-
-- VpnService.Builder setup
-- TUN interface handling
-- Packet read/write loop
-
-2. Packet Parsing
-
-- Parse IP packets manually
-- Detect protocol (TCP/UDP)
-- Extract source app UID
-
-3. App Identification
-
-- Map packets → UID → package name
-
-4. Filtering Engine
-
-- Rule-based filtering system:
-  IF app is blocked → DROP packet
-  ELSE → FORWARD packet
-
-5. DNS Blocking
-
-- Intercept DNS queries
-- Block domains using blacklist
-
----
-
-📂 OUTPUT FORMAT (VERY IMPORTANT)
-
-You MUST provide FULL PROJECT STRUCTURE:
-
-1. Complete folder structure
-2. Every file with full code:
-   - MainActivity.kt
-   - VpnService class
-   - Packet parser classes
-   - UI files
-   - Database
-   - Utils
-3. Gradle files
-4. AndroidManifest.xml (with ALL permissions)
-
-DO NOT skip ANY file.
-
----
-
-🤖 HUGGING FACE APK BUILD (IMPORTANT)
-
-I only have Hugging Face (no VPS).
-
-So also include:
-
-1. Dockerfile for building APK
-
-- Install Android SDK
-- Gradle build setup
-
-2. Build Script
-
-- Command to generate APK
-
-3. Instructions:
-
-- How to upload project to Hugging Face Space
-- How to trigger APK build
-- Where APK will be stored
-
----
-
-⚠️ CONSTRAINTS
-
-- Do NOT give pseudo code
-- Do NOT skip packet parsing
-- Do NOT simplify logic
-- Code must be realistic and runnable
-
----
-
-🎯 GOAL
-
-Output should be equivalent to a real GitHub project like NetGuard but simplified enough to understand.
-
----
-
-Now generate the COMPLETE project.
+### Step 4: Download the APK
+Once the build is complete, the `build_apk.sh` script will automatically start a Python HTTP server on port 7860.
+1. The Hugging Face Space will transition to the **Running** state.
+2. In the "App" tab of your Space, you will see a directory listing.
+3. Click on **app-debug.apk** to download the compiled application directly to your device or computer.
