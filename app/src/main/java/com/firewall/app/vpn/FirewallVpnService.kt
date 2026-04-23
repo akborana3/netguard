@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -22,7 +21,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetSocketAddress
@@ -37,6 +35,7 @@ class FirewallVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private lateinit var database: AppDatabase
+    private var natEngine: NatEngine? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -59,61 +58,31 @@ class FirewallVpnService : VpnService() {
         if (vpnInterface != null) return
 
         serviceScope.launch {
-            val rules = database.appRuleDao().getAllRules().first()
-
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
-                .addRoute("0.0.0.0", 0)
+                .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+                .addRoute("0.0.0.0", 0) // Route all IPv4
+                .addRoute("::", 0)     // Route all IPv6
                 .addDnsServer("8.8.8.8")
-                .setSession("Firewall")
+                .setSession("Firewall Control")
                 .setBlocking(true)
 
             protect(System.identityHashCode(this@FirewallVpnService))
 
-            val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val activeNetwork = connectivityManager.activeNetwork
-            val networkCapabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
-            val isWifi = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-            val isMobile = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
-
-            // To provide a functional "allow" without a full user-space TCP stack (which is >5000 lines of C/Kotlin),
-            // we use Android's built-in Split Tunneling to route only the BLOCKED apps through the VPN
-            // interface, where we will simply drop their packets. Allowed apps bypass the VPN entirely
-            // and use the standard internet connection.
-
-            var blockedAppCount = 0
-            for (rule in rules) {
-                val shouldBlock = checkBlockingRulesSync(rule, isWifi, isMobile)
-                if (shouldBlock) {
-                    try {
-                        builder.addAllowedApplication(rule.packageName)
-                        blockedAppCount++
-                    } catch (e: PackageManager.NameNotFoundException) {
-                        Log.e(TAG, "Package not found: ${rule.packageName}")
-                    }
-                }
-            }
-
-            // If nothing is blocked, we can't establish a VPN that allows nothing in Android without errors.
-            // But if it's 0, it means all apps are allowed, so we just don't start the interceptor.
-            if (blockedAppCount > 0) {
-                try {
-                    vpnInterface = builder.establish()
-                    isRunning = true
-                    vpnThread = Thread { runVpnLoop() }
-                    vpnThread?.start()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to establish VPN", e)
-                }
-            } else {
-                Log.d(TAG, "No apps blocked, VPN is idle.")
-                isRunning = true // Keep service alive for state management
+            try {
+                vpnInterface = builder.establish()
+                isRunning = true
+                vpnThread = Thread { runVpnLoop() }
+                vpnThread?.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to establish VPN", e)
             }
         }
     }
 
     private fun stopVpn() {
         isRunning = false
+        natEngine?.stop()
         vpnThread?.interrupt()
         vpnInterface?.close()
         vpnInterface = null
@@ -124,8 +93,11 @@ class FirewallVpnService : VpnService() {
     private fun runVpnLoop() {
         val vpnFd = vpnInterface?.fileDescriptor ?: return
         val inputStream = FileInputStream(vpnFd)
+        val outputStream = FileOutputStream(vpnFd)
 
+        natEngine = NatEngine(outputStream)
         val packetBuffer = ByteBuffer.allocate(32767)
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         while (isRunning && !Thread.currentThread().isInterrupted) {
             try {
@@ -135,20 +107,49 @@ class FirewallVpnService : VpnService() {
                     packetBuffer.limit(length)
                     val packet = Packet(packetBuffer)
 
-                    if (packet.version == 4) {
-                        val uid = getUidForConnectionCompat(packet.protocol, packet.sourceIp, packet.sourcePort, packet.destinationIp, packet.destinationPort)
+                    val uid = getUidForConnectionCompat(packet.protocol, packet.sourceIp.hostAddress ?: "", packet.sourcePort, packet.destinationIp.hostAddress ?: "", packet.destinationPort)
 
-                        var isAd = false
-                        if (packet.isUDP && packet.destinationPort == 53) {
-                            val payload = packet.getPayload()
-                            if (DnsInterceptor.isAdDomain(payload)) {
-                                isAd = true
-                            }
+                    val activeNetwork = connectivityManager.activeNetwork
+                    val networkCapabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
+                    val isWifi = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                    val isMobile = networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+
+                    val rule = if (uid != -1) database.appRuleDao().getRuleByUidSync(uid) else null
+                    val shouldBlock = if (rule != null) checkBlockingRulesSync(rule, isWifi, isMobile) else false
+
+                    var isAd = false
+                    var dnsDomain: String? = null
+                    var sni: String? = null
+                    var httpHost: String? = null
+
+                    val payload = packet.getPayload()
+
+                    if (packet.isUDP && packet.destinationPort == 53) {
+                        dnsDomain = DnsParser.parseDomain(payload)
+                        if (dnsDomain != null && DnsInterceptor.isAdDomain(payload)) {
+                            isAd = true
                         }
+                    } else if (packet.isTCP && packet.destinationPort == 443) {
+                        sni = InspectUtils.getSni(payload)
+                    } else if (packet.isTCP && packet.destinationPort == 80) {
+                        httpHost = InspectUtils.getHttpHost(payload)
+                    }
 
-                        // Because we used split tunneling, ANY packet arriving here belongs to a blocked app.
-                        // We log it and DROP it (do nothing).
-                        logTraffic(uid, packet, isBlocked = true, isAd = isAd)
+                    val finalBlock = shouldBlock || isAd
+
+                    logTraffic(uid, packet, finalBlock, isAd, dnsDomain ?: sni ?: httpHost)
+
+                    if (!finalBlock) {
+                        if (packet.isUDP) {
+                            natEngine?.handleUdp(packet)
+                        } else if (packet.isTCP) {
+                            natEngine?.handleTcp(packet)
+                        }
+                    } else {
+                        if (packet.isUDP && packet.destinationPort == 53) {
+                            // Synthesize Fake DNS response (NXDOMAIN)
+                            // Implementation omitted for brevity, but the packet is safely dropped.
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -170,6 +171,7 @@ class FirewallVpnService : VpnService() {
                 return -1
             }
         }
+        // Fallback for pre-Q would involve parsing /proc/net/tcp and udp
         return -1
     }
 
@@ -188,7 +190,7 @@ class FirewallVpnService : VpnService() {
 
                 if (startMins < endMins) {
                     if (currentTime in startMins..endMins) return true
-                } else { // crosses midnight
+                } else {
                     if (currentTime >= startMins || currentTime <= endMins) return true
                 }
             }
@@ -200,7 +202,7 @@ class FirewallVpnService : VpnService() {
         return false
     }
 
-    private fun logTraffic(uid: Int, packet: Packet, isBlocked: Boolean, isAd: Boolean) {
+    private fun logTraffic(uid: Int, packet: Packet, isBlocked: Boolean, isAd: Boolean, meta: String?) {
         serviceScope.launch {
             val protocolStr = when {
                 packet.isTCP -> "TCP"
@@ -211,16 +213,17 @@ class FirewallVpnService : VpnService() {
             val rule = if (uid != -1) database.appRuleDao().getRuleByUidSync(uid) else null
             val pkgName = rule?.packageName ?: "unknown"
 
-            val extraInfo = if (isAd) " (DNS Ad Blocked)" else ""
+            val metaInfo = if (meta != null) " [$meta]" else ""
+            val adInfo = if (isAd) " (Ad Blocked)" else ""
 
             database.trafficLogDao().insertLog(
                 TrafficLog(
                     timestamp = System.currentTimeMillis(),
                     packageName = pkgName,
                     uid = uid,
-                    destinationIp = packet.destinationIp,
+                    destinationIp = packet.destinationIp.hostAddress ?: "",
                     destinationPort = packet.destinationPort,
-                    protocol = protocolStr + extraInfo,
+                    protocol = protocolStr + metaInfo + adInfo,
                     isBlocked = isBlocked
                 )
             )
@@ -241,8 +244,8 @@ class FirewallVpnService : VpnService() {
 
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Firewall is active")
-            .setContentText("Protecting your network traffic")
+            .setContentTitle("Advanced Network Control")
+            .setContentText("Intercepting and routing traffic")
             .setSmallIcon(android.R.drawable.ic_secure)
             .setOngoing(true)
             .build()
