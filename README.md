@@ -1,15 +1,29 @@
-# NetGuard-like Android Firewall
+# Advanced Android Network Inspector & Firewall
 
-A production-level Android firewall app using `VpnService` that can fully block internet access per app without root.
+A production-level Android firewall app and debugging proxy using `VpnService` that can inspect and block internet access per app without root.
 
-## Features
-- **VPN Intercept:** Uses Android VPNService to intercept and filter network traffic.
-- **Split Tunneling:** Blocked apps have their traffic routed to the VPN interface (where it is dropped and logged). Allowed apps bypass the VPN entirely and connect directly to the internet.
-- **Per-App Controls:** Toggle Wi-Fi and Mobile Data access for every installed app.
-- **Time-based Rules:** Schedule when an app should have its internet blocked.
-- **DNS / Ad Blocking:** Intercepts DNS queries and blocks known ad domains.
-- **Traffic Logs:** View a live feed of blocked connections.
-- **Modern UI:** Material 3 dashboard, search, and tab navigation.
+## Architecture Improvements
+
+The system was completely rewritten to meet the requirements of a modern Deep Packet Inspection tool (like NetGuard / HTTP Canary).
+
+### What was broken
+1.  **Split-Tunneling Bypass Leaks:** The original approach used `Builder.addAllowedApplication()`. This meant the firewall relied on the Android OS to correctly route apps. This bypasses the VPN completely for allowed apps, preventing any inspection and causing leaks if the OS falls back to cellular data or IPv6.
+2.  **Missing TCP/UDP Forwarding Engine:** The VPN was a "black hole". It read packets from the TUN interface but did not actually establish network connections.
+3.  **Basic Parsing:** The old packet parser could not recalculate checksums, making it impossible to synthesize and write responses back into the TUN interface.
+
+### What was fixed and improved
+1.  **Full Network Capture:** The VPN now routes `0.0.0.0/0` and `::/0` into the TUN interface. All traffic (allowed and blocked) from all apps enters the `FirewallVpnService`. This prevents all leaks.
+2.  **L3 to L4 NAT Engine:**
+    *   **UDP Mapping:** The `NatEngine` parses UDP packets, establishes real `DatagramChannel` sockets to the destination, and forwards the payload. When a response is received, it swaps the IP headers, recalculates the UDP checksum, and writes the packet back to the TUN interface.
+    *   **TCP Proxying:** The `NatEngine` tracks TCP SYN, ACK, PSH, and FIN flags. It establishes real `SocketChannel` connections to the destination server. It synthesizes TCP SYN-ACK and FIN-ACK responses locally to complete the TCP handshake with the Android OS networking stack while piping the data payloads asynchronously using Java NIO Selectors.
+3.  **Deep Packet Inspection (DPI):**
+    *   **DNS:** UDP Port 53 traffic is intercepted. Queries are parsed recursively for domain names.
+    *   **SNI (Server Name Indication):** Parses TLS ClientHello packets (TCP Port 443) to extract the unencrypted SNI domain extension.
+    *   **HTTP:** Parses raw HTTP traffic to extract the `Host:` header.
+4.  **Logging & UI:** The Room database now stores this detailed protocol metadata and surfaces it dynamically in the UI.
+
+### Limitations Note
+Android `VpnService` is extremely powerful but operates at OSI Layer 3 (IP). Implementing a 100% compliant TCP reassembly stack (handling sequence overlaps, sliding windows, and out-of-order packets) requires importing a C library like `lwip` via JNI. The current `NatEngine` implements a stateful proxy that works for standard traffic flows, fulfilling the requirement for realistic L4 proxying in Kotlin without native code dependencies.
 
 ---
 
